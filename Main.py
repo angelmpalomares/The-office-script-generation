@@ -1,16 +1,11 @@
 import os
-from abc import ABC
-
 import pandas as pd
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
-import numpy as np
-import random
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import GPT2Tokenizer, GPT2LMHeadModel, AdamW, get_linear_schedule_with_warmup
-from tqdm import tqdm, trange
+from tqdm import tqdm
 import torch.nn.functional as F
-import csv
+
 torch.cuda.empty_cache()
 
 # Obtain data from the csv and make some processing
@@ -20,6 +15,7 @@ data.Character = data.Character.str.replace(" ", "_")
 data.Line = data.Character.astype(str) + ": " + data.Line.astype(str)
 clean_data = data[['Line']]
 
+
 # This class will help tokenize the data
 class ScriptLine(Dataset):
 
@@ -27,7 +23,6 @@ class ScriptLine(Dataset):
 
         self.tokenizer = GPT2Tokenizer.from_pretrained(gpt2_type)
         self.line = []
-
         for row in clean_data.Line:
             self.line.append(torch.tensor(
                 self.tokenizer.encode(f"<|{control_code}|>{row[:max_length]}<|endoftext|>")
@@ -44,6 +39,7 @@ class ScriptLine(Dataset):
 
 
 dataset = ScriptLine(clean_data.Line, truncate=True)
+
 
 # Accumulated batch size (since GPT2 is so big)
 def pack_tensor(new_tensor, packed_tensor, max_seq_len):
@@ -67,38 +63,31 @@ def train(
     device = torch.device("cuda:0")
     training_model = training_model.cuda()
     training_model.train()
-
     optimizer = AdamW(training_model.parameters(), lr=lr)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=-1
     )
-
     train_dataloader = DataLoader(training_set, batch_size=1, shuffle=True)
     loss = 0
     accumulating_batch_count = 0
     input_tensor = None
-
     for epoch in range(epochs):
 
         print(f"Training epoch {epoch}")
         print(loss)
         for idx, entry in tqdm(enumerate(train_dataloader)):
             (input_tensor, carry_on, remainder) = pack_tensor(entry, input_tensor, 768)
-
             if carry_on and idx != len(train_dataloader) - 1:
                 continue
-
             input_tensor = input_tensor.to(device)
             outputs = training_model(input_tensor, labels=input_tensor)
             loss = outputs[0]
             loss.backward()
-
             if (accumulating_batch_count % batch_size) == 0:
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
                 training_model.zero_grad()
-
             accumulating_batch_count += 1
             input_tensor = None
         if save_model_on_epoch:
@@ -108,51 +97,42 @@ def train(
             )
     return training_model
 
+
 # Get the tokenizer and model
 GPT2_tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
 GPT2_model = GPT2LMHeadModel.from_pretrained('gpt2')
-
 model = train(dataset, GPT2_model, GPT2_tokenizer)
 torch.save(model, "./model.pt")
-
-
-
 model = torch.load("./model.pt")
+
+
 def generate(
         model,
         tokenizer,
         prompt,
-        entry_length=500,  # maximum number of words
+        entry_length,  # maximum number of words
         top_p=0.9,
         temperature=1,
 ):
     model.eval()
-    generated_num = 0
     generated_list = []
-
     filter_value = -float("Inf")
-
     with torch.no_grad():
         entry_finished = False
         generated = torch.tensor(tokenizer.encode(prompt)).unsqueeze(0)
-
         for i in range(entry_length):
             outputs = model(generated, labels=generated)
             loss, logits = outputs[:2]
             logits = logits[:, -1, :] / (temperature if temperature > 0 else 1.0)
-
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
             sorted_indices_to_remove = cumulative_probs > top_p
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
                                                 ..., :-1
                                                 ].clone()
             sorted_indices_to_remove[..., 0] = 0
-
             indices_to_remove = sorted_indices[sorted_indices_to_remove]
             logits[:, indices_to_remove] = filter_value
-
             next_token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
             generated = torch.cat((generated, next_token), dim=1)
 
@@ -160,8 +140,6 @@ def generate(
                 entry_finished = True
 
             if entry_finished:
-                generated_num = generated_num + 1
-
                 output_list = list(generated.squeeze().numpy())
                 output_text = tokenizer.decode(output_list)
                 generated_list.append(output_text)
@@ -176,12 +154,11 @@ def generate(
 
 
 # Function to generate multiple sentences.
-def text_generation(texto):
-    x = generate(model.to('cpu'), GPT2_tokenizer, texto)[0]
+def text_generation(prompt, entry_length):
+    x = generate(model.to('cpu'), GPT2_tokenizer, prompt, entry_length=entry_length)[0]
     clean = x.replace("\\", "")
     to_remove = clean.split('.')[-1]
     return clean.replace(to_remove, '')
 
 
-print(text_generation("Michael: That's what she said"))
-
+print(text_generation("Ryan: girls in Indonesia love me", entry_length=500))
